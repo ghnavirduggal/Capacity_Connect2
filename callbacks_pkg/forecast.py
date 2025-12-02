@@ -31,10 +31,19 @@ def _parse_upload(contents: str, filename: str) -> Tuple[pd.DataFrame, str]:
     content_type, content_string = contents.split(",", 1)
     decoded = base64.b64decode(content_string)
     try:
-        if filename.lower().endswith(".csv"):
+        lower = filename.lower()
+        if lower.endswith(".csv"):
             df = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
         else:
-            df = pd.read_excel(io.BytesIO(decoded))
+            # Try common engines for xlsx/xls
+            try:
+                df = pd.read_excel(io.BytesIO(decoded), engine="openpyxl")
+            except Exception:
+                try:
+                    df = pd.read_excel(io.BytesIO(decoded))
+                except Exception:
+                    # Fallback: attempt CSV decode
+                    df = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
         msg = f"Loaded {len(df):,} rows from {filename}."
         return df, msg
     except Exception as exc:
