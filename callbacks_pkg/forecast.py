@@ -248,12 +248,12 @@ def _apply_transformations(df: pd.DataFrame) -> pd.DataFrame:
     return processed
 
 
-
 @app.callback(
     Output("vs-upload-msg", "children"),
     Output("vs-preview", "data"),
     Output("vs-preview", "columns"),
     Output("vs-data-store", "data"),
+    Output("vs-iq-store", "data"),
     Input("vs-upload", "contents"),
     State("vs-upload", "filename"),
     prevent_initial_call=True,
@@ -261,11 +261,31 @@ def _apply_transformations(df: pd.DataFrame) -> pd.DataFrame:
 def _on_vs_upload(contents, filename):
     if not contents or not filename:
         raise dash.exceptions.PreventUpdate
+
+    decoded_bytes = None
+    try:
+        _, content_string = contents.split(",", 1)
+        decoded_bytes = base64.b64decode(content_string)
+    except Exception:
+        decoded_bytes = None
+
     df, msg = _parse_upload(contents, filename)
     preview = df.head(50)
     cols = [{"name": c, "id": c} for c in preview.columns]
     store = df.to_json(date_format="iso", orient="split") if not df.empty else None
-    return msg, preview.to_dict("records"), cols, store
+    iq_store = None
+    if decoded_bytes is not None and filename.lower().endswith((".xlsx", ".xls")):
+        try:
+            xl = pd.ExcelFile(io.BytesIO(decoded_bytes))
+            iq_sheet = next((s for s in xl.sheet_names if "iq" in s.lower()), None)
+            if iq_sheet:
+                iq_df = xl.parse(iq_sheet)
+                if not iq_df.empty:
+                    iq_store = iq_df.to_json(date_format="iso", orient="split")
+                    msg = f"{msg} | IQ sheet '{iq_sheet}' loaded."
+        except Exception:
+            pass
+    return msg, preview.to_dict("records"), cols, store, iq_store
 
 
 @app.callback(
@@ -448,13 +468,15 @@ def _on_sa_upload(contents, filename):
     State("sa-prophet-order", "value"),
     State("sa-holdout", "value"),
     State("forecast-phase-store", "data"),
+    State("vs-data-store", "data"),
+    State("vs-iq-store", "data"),
     prevent_initial_call=True,
 )
-def _run_smoothing(n_basic, n_prophet, raw_json, window, threshold, prophet_order, holdout, phase_store):
+def _run_smoothing(n_basic, n_prophet, raw_json, window, threshold, prophet_order, holdout, phase_store, vs_data_json, vs_iq_json):
     if not n_basic and not n_prophet:
         raise dash.exceptions.PreventUpdate
     _ = holdout  # placeholder for future train/test split logic
-    if not raw_json:
+    if not raw_json and not vs_data_json:
         return (
             "Upload data to smooth.",
             True,
@@ -473,9 +495,16 @@ def _run_smoothing(n_basic, n_prophet, raw_json, window, threshold, prophet_orde
             phase_store,
         )
 
-    try:
-        df = pd.read_json(io.StringIO(raw_json), orient="split")
-    except Exception:
+    def _load_df(data_json):
+        try:
+            return pd.read_json(io.StringIO(data_json), orient="split")
+        except Exception:
+            return pd.DataFrame()
+
+    df = _load_df(raw_json) if raw_json else pd.DataFrame()
+    if df.empty and vs_data_json:
+        df = _load_df(vs_data_json)
+    if df.empty:
         return (
             "Could not read uploaded data.",
             True,
@@ -494,29 +523,80 @@ def _run_smoothing(n_basic, n_prophet, raw_json, window, threshold, prophet_orde
             phase_store,
         )
 
+    def _attach_iq(base_df: pd.DataFrame, iq_json: str) -> pd.DataFrame:
+        if not iq_json or "IQ_value" in base_df.columns:
+            return base_df
+        try:
+            iq_df = pd.read_json(io.StringIO(iq_json), orient="split")
+        except Exception:
+            return base_df
+        base_date_col = _pick_col(base_df, ("date", "ds", "timestamp"))
+        iq_date_col = _pick_col(iq_df, ("date", "ds", "timestamp"))
+        iq_val_col = _pick_col(iq_df, ("iq_value", "iq", "value"))
+        if not base_date_col or not iq_date_col or not iq_val_col:
+            return base_df
+        iq_use = iq_df[[iq_date_col, iq_val_col]].copy()
+        iq_use["__iq_date"] = pd.to_datetime(iq_use[iq_date_col], errors="coerce").dt.normalize()
+        iq_use["IQ_value"] = pd.to_numeric(iq_use[iq_val_col], errors="coerce")
+        base_df["__iq_date"] = pd.to_datetime(base_df[base_date_col], errors="coerce").dt.normalize()
+        base_df = base_df.merge(iq_use[["__iq_date", "IQ_value"]], on="__iq_date", how="left")
+        base_df = base_df.drop(columns=["__iq_date"])
+        return base_df
+
+    df = _attach_iq(df, vs_iq_json)
+
     triggered = dash.callback_context.triggered_id
     use_prophet = triggered == "sa-run-prophet"
 
+    message_text = ""
+    source_tag = "prophet" if use_prophet else "ewma"
     try:
         res = _smoothing_core(df, window, threshold, prophet_order if use_prophet else None)
+        message_text = f"Smoothing complete ({'Prophet' if use_prophet else 'EWMA'})."
     except Exception as exc:
-        return (
-            f"Smoothing failed: {exc}",
-            True,
-            _empty_fig("Error"),
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            _empty_fig(),
-            _empty_fig(),
-            None,
-            phase_store,
-        )
+        if use_prophet:
+            # Try a graceful fallback to EWMA if Prophet init fails
+            try:
+                res = _smoothing_core(df, window, threshold, None)
+                message_text = f"Prophet smoothing failed ({exc}). Fell back to EWMA."
+                use_prophet = False
+                source_tag = "ewma-fallback"
+            except Exception as exc2:
+                return (
+                    f"Smoothing failed (Prophet): {exc}; fallback error: {exc2}",
+                    True,
+                    _empty_fig("Error"),
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    _empty_fig(),
+                    _empty_fig(),
+                    None,
+                    phase_store,
+                )
+        else:
+            return (
+                f"Smoothing failed: {exc}",
+                True,
+                _empty_fig("Error"),
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                _empty_fig(),
+                _empty_fig(),
+                None,
+                phase_store,
+            )
 
     smoothed_tbl = res["smoothed"].copy()
     anomalies_tbl = res["anomalies"].copy()
@@ -530,7 +610,7 @@ def _run_smoothing(n_basic, n_prophet, raw_json, window, threshold, prophet_orde
         "ratio": res["ratio"].to_dict("records"),
         "capped": res["capped"].to_dict("records"),
         "pivot": res["pivot"].to_dict("records"),
-        "source": "prophet" if use_prophet else "ewma",
+        "source": source_tag,
     }
 
     phase_data = phase_store or {}
@@ -538,7 +618,7 @@ def _run_smoothing(n_basic, n_prophet, raw_json, window, threshold, prophet_orde
     phase_data["phase1_meta"] = {"source": payload["source"], "ts": pd.Timestamp.utcnow().isoformat()}
 
     return (
-        f"Smoothing complete ({'Prophet' if use_prophet else 'EWMA'}).",
+        message_text or f"Smoothing complete ({'Prophet' if use_prophet else 'EWMA'}).",
         True,
         res["fig_series"],
         anomalies_tbl.to_dict("records"),
@@ -1470,6 +1550,352 @@ def _tp_save_to_disk(n, final_json):
     try:
         df.to_csv(fpath, index=False)
         return f"Saved to {fpath}"
+    except Exception as exc:
+        return f"Save failed: {exc}"
+
+
+@app.callback(
+    Output("di-transform-msg", "children"),
+    Output("di-transform-preview", "data"),
+    Output("di-transform-preview", "columns"),
+    Output("di-transform-group", "options"),
+    Output("di-transform-group", "value"),
+    Output("di-transform-month", "options"),
+    Output("di-transform-month", "value"),
+    Output("di-transform-store", "data"),
+    Input("di-load-transform", "n_clicks"),
+    Input("di-upload-transform", "contents"),
+    State("di-upload-transform", "filename"),
+    prevent_initial_call=True,
+)
+def _di_load_transform(n_load, contents, filename):
+    ctx = dash.callback_context
+    trig = ctx.triggered_id if ctx.triggered_id else None
+
+    def _load_latest():
+        base_dir_txt = Path(__file__).resolve().parent.parent / "latest_forecast_base_dir.txt"
+        search_dir = Path(__file__).resolve().parent.parent / "exports"
+        if base_dir_txt.exists():
+            try:
+                txt = base_dir_txt.read_text().strip()
+                if txt:
+                    candidate = Path(txt)
+                    if candidate.exists():
+                        search_dir = candidate
+            except Exception:
+                pass
+        files = sorted(search_dir.glob("Monthly_Forecast_with_Adjustments_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not files:
+            return pd.DataFrame(), "No transformed forecast files found."
+        try:
+            df_latest = pd.read_csv(files[0])
+            return df_latest, f"Loaded {files[0].name}."
+        except Exception as exc:
+            return pd.DataFrame(), f"Could not load latest file: {exc}"
+
+    if trig == "di-load-transform" and n_load:
+        df, msg = _load_latest()
+    elif trig == "di-upload-transform" and contents and filename:
+        df, msg = _parse_upload(contents, filename)
+    else:
+        raise dash.exceptions.PreventUpdate
+
+    if df is None or df.empty:
+        return msg, [], [], [], None, [], None, None
+
+    def _opts(colname: str):
+        uniq = sorted(pd.unique(df[colname].dropna()).tolist())
+        return [{"label": str(u), "value": u} for u in uniq]
+
+    df_cols = {c.lower(): c for c in df.columns}
+    fg_col = df_cols.get("forecast_group") or df_cols.get("queue_name") or df_cols.get("category")
+    group_opts = _opts(fg_col) if fg_col else []
+    group_val = group_opts[0]["value"] if group_opts else None
+
+    month_val = None
+    month_opts: list[dict] = []
+    if "Month_Year" in df.columns:
+        df["Month_Year"] = df["Month_Year"].astype(str)
+        month_opts = _opts("Month_Year")
+        month_val = month_opts[0]["value"] if month_opts else None
+    else:
+        month_col = df_cols.get("month")
+        year_col = df_cols.get("year")
+        if month_col and year_col:
+            df["_month_year"] = df[month_col].astype(str).str[:3] + " " + df[year_col].astype(str)
+            month_opts = _opts("_month_year")
+            month_val = month_opts[0]["value"] if month_opts else None
+
+    preview = df.head(200)
+    return (
+        msg,
+        preview.to_dict("records"),
+        _cols(preview),
+        group_opts,
+        group_val,
+        month_opts,
+        month_val,
+        df.to_json(date_format="iso", orient="split"),
+    )
+
+
+@app.callback(
+    Output("di-upload-msg", "children"),
+    Output("di-preview", "data"),
+    Output("di-preview", "columns"),
+    Output("di-interval-store", "data"),
+    Input("di-upload", "contents"),
+    State("di-upload", "filename"),
+    prevent_initial_call=True,
+)
+def _di_on_interval_upload(contents, filename):
+    if not contents or not filename:
+        raise dash.exceptions.PreventUpdate
+    df, msg = _parse_upload(contents, filename)
+    preview = df.head(200)
+    return msg, preview.to_dict("records"), _cols(preview), df.to_json(date_format="iso", orient="split")
+
+
+@app.callback(
+    Output("di-run-status", "children"),
+    Output("di-daily-table", "data"),
+    Output("di-daily-table", "columns"),
+    Output("di-interval-forecast-table", "data"),
+    Output("di-interval-forecast-table", "columns"),
+    Output("di-results-store", "data"),
+    Input("di-run-btn", "n_clicks"),
+    State("di-transform-store", "data"),
+    State("di-interval-store", "data"),
+    State("di-transform-group", "value"),
+    State("di-transform-month", "value"),
+    prevent_initial_call=True,
+)
+def _di_run_interval_forecast(n, transform_json, interval_json, group_value, month_value):
+    if not n:
+        raise dash.exceptions.PreventUpdate
+    if not transform_json:
+        return ("Load a transformed forecast first.", [], [], [], [], None)
+    if not interval_json:
+        return ("Upload interval history first.", [], [], [], [], None)
+    try:
+        tf = pd.read_json(io.StringIO(transform_json), orient="split")
+    except Exception:
+        return ("Could not read transformed forecast.", [], [], [], [], None)
+    try:
+        iv = pd.read_json(io.StringIO(interval_json), orient="split")
+    except Exception:
+        return ("Could not read interval data.", [], [], [], [], None)
+
+    tf_cols = {c.lower(): c for c in tf.columns}
+    fg_col = tf_cols.get("forecast_group") or tf_cols.get("queue_name") or tf_cols.get("category")
+    month_col = None
+    if "Month_Year" in tf.columns:
+        month_col = "Month_Year"
+    elif "month_year" in tf.columns:
+        month_col = "month_year"
+    elif tf_cols.get("month") and tf_cols.get("year"):
+        tf["_month_year"] = tf[tf_cols["month"]].astype(str).str[:3] + " " + tf[tf_cols["year"]].astype(str)
+        month_col = "_month_year"
+
+    val_col = None
+    for cand in [
+        "Final_Forecast",
+        "Final_Forecast_Post_Transformations",
+        "Forecast_Marketing Campaign 3",
+        "Forecast_Marketing Campaign 2",
+        "Forecast_Marketing Campaign 1",
+    ]:
+        if cand in tf.columns:
+            val_col = cand
+            break
+    if not val_col:
+        return ("No forecast value column found (e.g., Final_Forecast).", [], [], [], [], None)
+
+    tf_filt = tf.copy()
+    if fg_col and group_value:
+        tf_filt = tf_filt[tf_filt[fg_col] == group_value]
+    if month_col and month_value:
+        tf_filt = tf_filt[tf_filt[month_col].astype(str) == str(month_value)]
+    if tf_filt.empty:
+        return ("No matching row for the selected group/month.", [], [], [], [], None)
+    forecast_val = pd.to_numeric(tf_filt[val_col], errors="coerce").dropna()
+    if forecast_val.empty:
+        return ("Selected forecast value is missing.", [], [], [], [], None)
+    monthly_forecast = float(forecast_val.iloc[0])
+
+    date_col = _pick_col(iv, ("date", "ds", "timestamp"))
+    ivl_col = _pick_col(iv, ("interval", "time", "interval_start"))
+    vol_col = _pick_col(iv, ("volume", "calls", "items", "count"))
+    if not date_col or not ivl_col or not vol_col:
+        return ("Interval data must have date, interval, and volume columns.", [], [], [], [], None)
+    d = iv.copy()
+    d["date"] = pd.to_datetime(d[date_col], errors="coerce")
+    d["interval"] = d[ivl_col].astype(str)
+    d["volume"] = pd.to_numeric(d[vol_col], errors="coerce")
+    d = d.dropna(subset=["date", "interval", "volume"])
+    if d.empty:
+        return ("Interval data is empty after cleaning.", [], [], [], [], None)
+
+    max_date = d["date"].max()
+    if pd.notna(max_date):
+        cutoff = max_date - pd.DateOffset(months=3)
+        d = d[d["date"] >= cutoff]
+
+    daily_totals = d.groupby("date")["volume"].sum()
+    d = d.merge(daily_totals.rename("day_total"), on="date", how="left")
+    d = d[d["day_total"] > 0]
+    d["ratio"] = d["volume"] / d["day_total"]
+    d["weekday"] = d["date"].dt.day_name()
+
+    interval_ratio = d.groupby(["interval", "weekday"])["ratio"].mean().reset_index()
+    overall_interval_ratio = d.groupby("interval")["ratio"].mean().reset_index()
+
+    weekday_day_avg = daily_totals.groupby(daily_totals.index.day_name()).mean()
+    weekday_day_avg = weekday_day_avg[weekday_day_avg > 0]
+
+    def _parse_month(m):
+        for fmt in ["%b %Y", "%b-%y", "%B %Y"]:
+            try:
+                return pd.to_datetime(m, format=fmt)
+            except Exception:
+                continue
+        try:
+            return pd.to_datetime(m)
+        except Exception:
+            return None
+
+    month_dt = _parse_month(month_value or "")
+    if month_dt is None or pd.isna(month_dt):
+        return ("Could not parse selected month.", [], [], [], [], None)
+    days_in_month = (month_dt + pd.offsets.MonthEnd(0)).day
+    date_range = pd.date_range(month_dt.replace(day=1), periods=days_in_month, freq="D")
+
+    base_weights = []
+    for dt_val in date_range:
+        wd = dt_val.day_name()
+        w = weekday_day_avg.get(wd, weekday_day_avg.mean() if not weekday_day_avg.empty else 1.0)
+        base_weights.append(float(w or 0.0))
+    weight_sum = sum(base_weights) or 1.0
+    norm_weights = [w / weight_sum for w in base_weights]
+    daily_vals = [round(monthly_forecast * w, 0) for w in norm_weights]
+
+    daily_tbl = pd.DataFrame(
+        {
+            "Date": date_range.date,
+            "Weekday": [d.day_name() for d in date_range],
+            "Daily_Forecast": daily_vals,
+        }
+    )
+
+    interval_rows = []
+    for dt_val, dv in zip(date_range, daily_vals):
+        wd = dt_val.day_name()
+        dist = interval_ratio[interval_ratio["weekday"] == wd][["interval", "ratio"]]
+        if dist.empty:
+            dist = overall_interval_ratio.copy()
+        if dist.empty:
+            continue
+        rsum = dist["ratio"].sum()
+        if rsum <= 0:
+            continue
+        dist["ratio"] = dist["ratio"] / rsum
+        dist["interval_forecast"] = (dist["ratio"] * dv).round(0)
+        dist["Date"] = dt_val.date()
+        dist["Weekday"] = wd
+        interval_rows.append(dist[["Date", "Weekday", "interval", "interval_forecast"]])
+    interval_tbl = pd.concat(interval_rows, ignore_index=True) if interval_rows else pd.DataFrame()
+    if not interval_tbl.empty:
+        interval_tbl = interval_tbl.rename(columns={"interval": "Interval", "interval_forecast": "Interval_Forecast"})
+
+    results = {
+        "daily": daily_tbl.to_dict("records"),
+        "interval": interval_tbl.to_dict("records"),
+        "meta": {
+            "group": group_value,
+            "month": str(month_value),
+            "monthly_forecast": monthly_forecast,
+            "interval_history_rows": len(d),
+        },
+    }
+    status = f"Interval forecast ready for {group_value or 'all groups'} | {month_value} | monthly {monthly_forecast:,.0f}"
+    return (
+        status,
+        daily_tbl.to_dict("records"),
+        _cols(daily_tbl),
+        interval_tbl.to_dict("records"),
+        _cols(interval_tbl),
+        json.dumps(results),
+    )
+
+
+@app.callback(
+    Output("di-download-daily", "data"),
+    Input("di-download-daily-btn", "n_clicks"),
+    State("di-results-store", "data"),
+    prevent_initial_call=True,
+)
+def _di_download_daily(n, results_json):
+    if not n:
+        raise dash.exceptions.PreventUpdate
+    if not results_json:
+        return dash.no_update
+    try:
+        payload = json.loads(results_json)
+    except Exception:
+        return dash.no_update
+    daily = pd.DataFrame(payload.get("daily", []))
+    if daily.empty:
+        return dash.no_update
+    return dcc.send_data_frame(daily.to_csv, "daily_forecast.csv", index=False)
+
+
+@app.callback(
+    Output("di-download-interval", "data"),
+    Input("di-download-interval-btn", "n_clicks"),
+    State("di-results-store", "data"),
+    prevent_initial_call=True,
+)
+def _di_download_interval(n, results_json):
+    if not n:
+        raise dash.exceptions.PreventUpdate
+    if not results_json:
+        return dash.no_update
+    try:
+        payload = json.loads(results_json)
+    except Exception:
+        return dash.no_update
+    interval = pd.DataFrame(payload.get("interval", []))
+    if interval.empty:
+        return dash.no_update
+    return dcc.send_data_frame(interval.to_csv, "interval_forecast.csv", index=False)
+
+
+@app.callback(
+    Output("di-save-status", "children"),
+    Input("di-save-btn", "n_clicks"),
+    State("di-results-store", "data"),
+    prevent_initial_call=True,
+)
+def _di_save_results(n, results_json):
+    if not n:
+        raise dash.exceptions.PreventUpdate
+    if not results_json:
+        return "Run interval forecast first."
+    try:
+        payload = json.loads(results_json)
+    except Exception as exc:
+        return f"Could not parse results: {exc}"
+    outdir = Path(__file__).resolve().parent.parent / "exports"
+    outdir.mkdir(exist_ok=True)
+    ts = pd.Timestamp.utcnow()
+    daily = pd.DataFrame(payload.get("daily", []))
+    interval = pd.DataFrame(payload.get("interval", []))
+    try:
+        daily_path = outdir / f"daily_forecast_{ts:%Y%m%d_%H%M%S}.csv"
+        interval_path = outdir / f"interval_forecast_{ts:%Y%m%d_%H%M%S}.csv"
+        daily.to_csv(daily_path, index=False)
+        interval.to_csv(interval_path, index=False)
+        return f"Saved to {daily_path} and {interval_path}"
     except Exception as exc:
         return f"Save failed: {exc}"
 
