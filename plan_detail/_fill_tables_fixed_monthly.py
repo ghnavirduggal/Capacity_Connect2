@@ -10,7 +10,7 @@ import datetime as dt
 from cap_db import load_df
 from cap_store import load_roster_long, resolve_holidays, resolve_settings
 from capacity_core import required_fte_daily
-from plan_detail._calc import _load_roster_normalized, _nh_effective_count 
+from plan_detail._calc import _load_roster_normalized, _nh_effective_count, get_cached_consolidated_calcs 
 from plan_detail._common import _assemble_bo, _assemble_chat, _assemble_ob, _assemble_voice, _blank_grid, _canon_scope, _first_non_empty_ts, _learning_curve_for_week, _load_or_blank, _load_or_empty_bulk_files, _load_or_empty_notes, _load_ts_with_fallback, _parse_ratio_setting, get_plan_meta
 from plan_store import get_plan
 from dash import dash_table
@@ -257,6 +257,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     )
     loc_first = (p.get("location") or p.get("country") or p.get("site") or "").strip()
     settings = resolve_settings(ba=p.get("vertical"), subba=p.get("sub_ba"), lob=ch_first)
+    calc_bundle = get_cached_consolidated_calcs(int(pid), settings=settings, version_token=_tick)
     holidays_df = resolve_holidays(
         ba=p.get("vertical"),
         subba=p.get("sub_ba"),
@@ -962,9 +963,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             fw.loc[fw["metric"] == "Occupancy", m] = occ_m[m]
     # Override monthly occupancy for past/current months using interval roll-up
     try:
-        from plan_detail._calc import consolidated_calcs
         ch_low = str(ch_first or '').strip().lower()
-        res = consolidated_calcs(pid, 'month')
+        res = calc_bundle or {}
         key_ivl_a = 'voice_ivl_a' if ch_low == 'voice' else ('chat_ivl_a' if ch_low == 'chat' else ('ob_ivl_a' if ch_low in ('outbound','ob') else None))
         key_ivl_f = 'voice_ivl_f' if ch_low == 'voice' else ('chat_ivl_f' if ch_low == 'chat' else ('ob_ivl_f' if ch_low in ('outbound','ob') else None))
         df_ivl = None
@@ -2821,9 +2821,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
 
     # ---- Fallback from interval→daily→monthly when available ----
     try:
-        from plan_detail._calc import consolidated_calcs
         ch_low = str(ch_first or "").strip().lower()
-        res = consolidated_calcs(pid, 'month')
+        res = calc_bundle or {}
         key = 'voice_month' if ch_low == 'voice' else ('chat_month' if ch_low == 'chat' else ('ob_month' if ch_low in ('outbound','ob') else 'bo_month'))
         mdf = res.get(key, pd.DataFrame())
         if isinstance(mdf, pd.DataFrame) and not mdf.empty:
