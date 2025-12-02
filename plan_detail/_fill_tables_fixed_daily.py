@@ -10,7 +10,15 @@ from cap_store import resolve_settings
 from cap_db import load_df
 from ._grain_cols import day_cols_for_weeks
 from ._common import _week_span, _canon_scope, _monday, get_plan_meta, _load_ts_with_fallback, _assemble_voice, _assemble_chat, _assemble_ob, _assemble_bo
-from ._calc import _voice_interval_calc, _chat_interval_calc, _ob_interval_calc, _daily_from_intervals, _bo_daily_calc, _fill_tables_fixed
+from ._calc import (
+    _voice_interval_calc,
+    _chat_interval_calc,
+    _ob_interval_calc,
+    _daily_from_intervals,
+    _bo_daily_calc,
+    _fill_tables_fixed,
+    get_cached_consolidated_calcs,
+)
 
 
 # --- UI helper: keep the first return a DataTable (same as Interval filler expects) ---
@@ -161,8 +169,60 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             w = grp["staff_seconds"].sum()
             out[str(dd)] = float((grp["staff_seconds"] * grp["occupancy"]).sum() / w) if w > 0 else 0.0
         return out
-    
-    # Helper: compute per-interval calcs if interval uploads are present
+    # Pull heavy interval/daily calcs from shared cache (computed once per plan/tick)
+    calc_bundle = get_cached_consolidated_calcs(
+        int(pid),
+        settings=_settings,
+        version_token=_tick,
+    ) if pid else {}
+    def _from_bundle(key: str) -> pd.DataFrame:
+        if not isinstance(calc_bundle, dict):
+            return pd.DataFrame()
+        val = calc_bundle.get(key)
+        return val if isinstance(val, pd.DataFrame) else pd.DataFrame()
+
+    # Compute interval calcs (if present) and then daily rollups for forecast and actual
+    ivl_calc_f = pd.DataFrame()
+    ivl_calc_a = pd.DataFrame()
+    ivl_calc_t = pd.DataFrame()
+    day_calc_f = pd.DataFrame()
+    day_calc_a = pd.DataFrame()
+    day_calc_t = pd.DataFrame()
+    weight_col_ivl = "volume" if ch.startswith("voice") else "items"
+
+    if ch.startswith("voice"):
+        ivl_calc_f = _from_bundle("voice_ivl_f")
+        ivl_calc_a = _from_bundle("voice_ivl_a")
+        ivl_calc_t = _from_bundle("voice_ivl_t")
+        day_calc_f = _from_bundle("voice_day_f")
+        day_calc_a = _from_bundle("voice_day_a")
+        day_calc_t = _from_bundle("voice_day_t") if "voice_day_t" in (calc_bundle or {}) else pd.DataFrame()
+        if day_calc_f.empty:
+            day_calc_f = _from_bundle("voice_day")
+    elif ch.startswith("chat"):
+        ivl_calc_f = _from_bundle("chat_ivl_f")
+        ivl_calc_a = _from_bundle("chat_ivl_a")
+        ivl_calc_t = _from_bundle("chat_ivl_t")
+        day_calc_f = _from_bundle("chat_day_f")
+        day_calc_a = _from_bundle("chat_day_a")
+        day_calc_t = _from_bundle("chat_day_t") if "chat_day_t" in (calc_bundle or {}) else pd.DataFrame()
+        if day_calc_f.empty:
+            day_calc_f = _from_bundle("chat_day")
+    elif ch.startswith("back office") or ch in ("bo", "backoffice"):
+        day_calc_f = _from_bundle("bo_day_f")
+        day_calc_a = _from_bundle("bo_day_a")
+        day_calc_t = _from_bundle("bo_day_t")
+    else:
+        ivl_calc_f = _from_bundle("ob_ivl_f")
+        ivl_calc_a = _from_bundle("ob_ivl_a")
+        ivl_calc_t = _from_bundle("ob_ivl_t")
+        day_calc_f = _from_bundle("ob_day_f")
+        day_calc_a = _from_bundle("ob_day_a")
+        day_calc_t = _from_bundle("ob_day_t") if "ob_day_t" in (calc_bundle or {}) else pd.DataFrame()
+        if day_calc_f.empty:
+            day_calc_f = _from_bundle("ob_day")
+
+    # Fallback to local computation if cache miss (keeps legacy behavior intact)
     def _interval_calc(df: pd.DataFrame, channel: str) -> pd.DataFrame:
         if not (isinstance(df, pd.DataFrame) and not df.empty and "interval" in df.columns):
             return pd.DataFrame()
@@ -171,7 +231,6 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         elif channel.startswith("chat"):
             return _chat_interval_calc(df, _settings, ivl_min)
         elif channel.startswith("back office") or channel in ("bo","backoffice"):
-            # BO daily calcs handled separately (TAT/Erlang on daily totals)
             return pd.DataFrame()
         else:
             x = df.copy()
@@ -182,27 +241,28 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                     x = x.rename(columns={"volume": "items"})
             return _ob_interval_calc(x, _settings, ivl_min)
 
-    # Compute interval calcs (if present) and then daily rollups for forecast and actual
-    ivl_calc_f = _interval_calc(dfF, ch)
-    ivl_calc_a = _interval_calc(dfA, ch)
-    ivl_calc_t = _interval_calc(dfT, ch)
+    if ivl_calc_f.empty and isinstance(dfF, pd.DataFrame):
+        ivl_calc_f = _interval_calc(dfF, ch)
+    if ivl_calc_a.empty and isinstance(dfA, pd.DataFrame):
+        ivl_calc_a = _interval_calc(dfA, ch)
+    if ivl_calc_t.empty and isinstance(dfT, pd.DataFrame):
+        ivl_calc_t = _interval_calc(dfT, ch)
 
-    # Pick weight column for daily rollup from intervals
-    weight_col_ivl = "volume" if ch.startswith("voice") else "items"
-
-    if isinstance(ivl_calc_f, pd.DataFrame) and not ivl_calc_f.empty:
-        day_calc_f = _daily_from_intervals(ivl_calc_f, _settings, weight_col_ivl)
-    else:
-        # Fallback for channels that may upload daily-only data
-        day_calc_f = _bo_daily_calc(dfF, _settings) if (isinstance(dfF, pd.DataFrame) and not dfF.empty and not ch.startswith("voice")) else pd.DataFrame()
-    if isinstance(ivl_calc_a, pd.DataFrame) and not ivl_calc_a.empty:
-        day_calc_a = _daily_from_intervals(ivl_calc_a, _settings, weight_col_ivl)
-    else:
-        day_calc_a = _bo_daily_calc(dfA, _settings) if (isinstance(dfA, pd.DataFrame) and not dfA.empty and not ch.startswith("voice")) else pd.DataFrame()
-    if isinstance(ivl_calc_t, pd.DataFrame) and not ivl_calc_t.empty:
-        day_calc_t = _daily_from_intervals(ivl_calc_t, _settings, weight_col_ivl)
-    else:
-        day_calc_t = pd.DataFrame()
+    if day_calc_f.empty:
+        if isinstance(ivl_calc_f, pd.DataFrame) and not ivl_calc_f.empty:
+            day_calc_f = _daily_from_intervals(ivl_calc_f, _settings, weight_col_ivl)
+        elif isinstance(dfF, pd.DataFrame) and not dfF.empty and not ch.startswith("voice"):
+            day_calc_f = _bo_daily_calc(dfF, _settings)
+    if day_calc_a.empty:
+        if isinstance(ivl_calc_a, pd.DataFrame) and not ivl_calc_a.empty:
+            day_calc_a = _daily_from_intervals(ivl_calc_a, _settings, weight_col_ivl)
+        elif isinstance(dfA, pd.DataFrame) and not dfA.empty and not ch.startswith("voice"):
+            day_calc_a = _bo_daily_calc(dfA, _settings)
+    if day_calc_t.empty:
+        if isinstance(ivl_calc_t, pd.DataFrame) and not ivl_calc_t.empty:
+            day_calc_t = _daily_from_intervals(ivl_calc_t, _settings, weight_col_ivl)
+        else:
+            day_calc_t = pd.DataFrame()
 
     # Extract metrics into dicts keyed by date
     m_fte_f = (
