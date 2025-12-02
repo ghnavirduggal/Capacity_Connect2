@@ -4,7 +4,7 @@ import math
 import re
 import os
 import datetime as dt
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import pandas as pd
 import numpy as np
 import dash
@@ -38,6 +38,63 @@ from ._common import (
     required_fte_daily,
     load_roster_long,
 )
+
+# Simple in-memory cache so expensive interval/daily rollups are reused across grains
+_CONSOLIDATED_CACHE: dict[tuple[int, int, str, int], dict] = {}
+
+
+def _cache_key(pid: int, ivl_min: int, plan_date: dt.date | None, version_token: Any) -> tuple[int, int, str, int]:
+    try:
+        ver = int(version_token or 0)
+    except Exception:
+        ver = abs(hash(str(version_token)))
+    return (
+        int(pid),
+        int(ivl_min),
+        str(plan_date or ""),
+        ver,
+    )
+
+
+def get_cached_consolidated_calcs(
+    pid: int,
+    *,
+    settings: dict | None = None,
+    plan_date: dt.date | None = None,
+    version_token: Any = None,
+) -> dict:
+    """
+    Run consolidated_calcs once per plan/tick/interval size and reuse it for all views.
+    This avoids re-running interval Erlang loops for weekly/daily/monthly toggles.
+    """
+    plan = get_plan(pid) or {}
+    effective_settings = dict(
+        settings
+        or resolve_settings(
+            ba=plan.get("vertical"),
+            subba=plan.get("sub_ba"),
+            lob=(plan.get("channel") or plan.get("lob")),
+            for_date=(plan_date.isoformat() if isinstance(plan_date, dt.date) else None),
+        )
+    )
+    ivl_min = int(float(effective_settings.get("interval_minutes", 30) or 30))
+    key = _cache_key(pid, ivl_min, plan_date, version_token)
+    cached = _CONSOLIDATED_CACHE.get(key)
+    if cached is not None:
+        return cached
+    bundle = consolidated_calcs(
+        pid,
+        "week",
+        plan_date=plan_date,
+        settings=effective_settings,
+        ivl_min_override=ivl_min,
+    )
+    # cap cache growth
+    if len(_CONSOLIDATED_CACHE) > 32:
+        _CONSOLIDATED_CACHE.pop(next(iter(_CONSOLIDATED_CACHE)), None)
+    _CONSOLIDATED_CACHE[key] = bundle
+    return bundle
+
 
 # Normalize roster loader (backward-compatible with legacy column names)
 def _load_roster_normalized(pid: int) -> pd.DataFrame:
@@ -556,7 +613,13 @@ def _monthly_from_daily(day_df: pd.DataFrame) -> pd.DataFrame:
 # Public entry point used by the three views
 # -----------------------------
 
-def consolidated_calcs(pid: int, grain: str, plan_date: Optional[dt.date] = None) -> dict:
+def consolidated_calcs(
+    pid: int,
+    grain: str,
+    plan_date: Optional[dt.date] = None,
+    settings: Optional[dict] = None,
+    ivl_min_override: Optional[int] = None,
+) -> dict:
     """
     Returns a dict with keys:
       - 'voice_ivl', 'chat_ivl', 'ob_ivl' : interval-level calc tables (if data uploaded)
@@ -566,9 +629,19 @@ def consolidated_calcs(pid: int, grain: str, plan_date: Optional[dt.date] = None
     Uses uploaded granularity as-is (interval vs daily).
     """
     plan = get_plan(pid) or {}
-    settings = resolve_settings(pid) if "resolve_settings" in globals() else (plan.get("settings") or {})
+    settings = dict(
+        settings
+        or resolve_settings(
+            ba=plan.get("vertical"),
+            subba=plan.get("sub_ba"),
+            lob=(plan.get("channel") or plan.get("lob")),
+            for_date=(plan_date.isoformat() if isinstance(plan_date, dt.date) else None),
+        )
+    )
     g = (grain or "interval").lower()
-    ivl_min = int(float(settings.get("interval_minutes", 30) or 30))
+    ivl_min = int(
+        float(ivl_min_override if ivl_min_override is not None else settings.get("interval_minutes", 30) or 30)
+    )
     # Assemble uploads (use canonical 3/4-part scope key)
     sk = _canon_scope(
         plan.get("vertical"),
@@ -963,6 +1036,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     wk_aht_sut_actual, wk_aht_sut_forecast, wk_aht_sut_budget = {}, {}, {}
     ivl_min = int(float(settings.get("interval_minutes", 30)) or 30)
     ivl_sec = 60 * ivl_min
+    calc_bundle = get_cached_consolidated_calcs(
+        int(pid),
+        settings=settings,
+        plan_date=None,
+        version_token=_tick,
+    )
 
     weekly_voice_intervals = {}
     def _week_cov(df: pd.DataFrame) -> dict:
@@ -1436,7 +1515,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
 
     # Override weekly Occupancy for past/current weeks using roll-up from intervals
     try:
-        res = consolidated_calcs(pid, 'week')
+        res = calc_bundle or {}
         ch_low = str(ch_first or '').strip().lower()
         key_ivl_a = 'voice_ivl_a' if ch_low == 'voice' else ('chat_ivl_a' if ch_low == 'chat' else ('ob_ivl_a' if ch_low in ('outbound','ob') else None))
         key_ivl_f = 'voice_ivl_f' if ch_low == 'voice' else ('chat_ivl_f' if ch_low == 'chat' else ('ob_ivl_f' if ch_low in ('outbound','ob') else None))
@@ -3250,7 +3329,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     # ---- Fallback from interval→daily rollups when available ----
     try:
         ch_low = str(ch_first or "").strip().lower()
-        res = consolidated_calcs(pid, 'week')
+        res = calc_bundle or {}
         key = 'voice_week' if ch_low == 'voice' else ('chat_week' if ch_low == 'chat' else ('ob_week' if ch_low in ('outbound','ob') else 'bo_week'))
         wdf = res.get(key, pd.DataFrame())
         if isinstance(wdf, pd.DataFrame) and not wdf.empty:
