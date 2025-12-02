@@ -330,6 +330,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     # FW metrics
     # Shape FW rows to match weekly view spec (fields/ordering), falling back to defaults
     fw_metrics: List[str] = []
+    weekly = None
     try:
         weeks = _week_span(plan.get("start_week"), plan.get("end_week"))
         weekly_fw_cols = [{"name": "Metric", "id": "metric", "editable": False}] + [{"name": w, "id": w} for w in weeks]
@@ -354,10 +355,11 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         "Projected Service Level",
     ]
     try:
-        # Reuse weekly call above to pick weekly upper spec
-        weeks = _week_span(plan.get("start_week"), plan.get("end_week"))
-        weekly_fw_cols = [{"name": "Metric", "id": "metric", "editable": False}] + [{"name": w, "id": w} for w in weeks]
-        weekly = _fill_tables_fixed(ptype, pid, weekly_fw_cols, _tick, whatif=whatif, grain='week')
+        # Reuse weekly call above (cached in `weekly`) to pick weekly upper spec
+        if weekly is None:
+            weeks = _week_span(plan.get("start_week"), plan.get("end_week"))
+            weekly_fw_cols = [{"name": "Metric", "id": "metric", "editable": False}] + [{"name": w, "id": w} for w in weeks]
+            weekly = _fill_tables_fixed(ptype, pid, weekly_fw_cols, _tick, whatif=whatif, grain='week')
         (upper_wk, *_rest) = weekly
         upper_df_w = pd.DataFrame(getattr(upper_wk, 'data', None) or [])
         if isinstance(upper_df_w, pd.DataFrame) and not upper_df_w.empty and "metric" in upper_df_w.columns:
