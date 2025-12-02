@@ -259,6 +259,7 @@ def page_forecast_section(slug: str):
                                     id="vs-upload",
                                     children=html.Div(["Drag & drop or ", html.Strong("select a CSV/XLSX file")]),
                                     multiple=False,
+                                    accept=".csv,.xls,.xlsx",
                                     className="border border-secondary rounded p-3 mb-2 bg-light",
                                 ),
                                 html.Div(id="vs-upload-msg", className="small text-muted"),
@@ -700,22 +701,28 @@ def page_forecast_section(slug: str):
         ]
 
     def _generic_step_layout(step_meta, body, button_id, next_slug):
+        has_next = bool(next_slug)
+        next_label = next_slug.replace("-", " ").title() if has_next else "Forecast Home"
+        next_href = f"/forecast/{next_slug}" if has_next else "/forecast"
+        modal_body = f"Move to {next_label}?" if has_next else "Return to the Forecast overview?"
+        next_btn_text = "Next →" if has_next else "Back to Forecast"
+        save_btn_text = "Save & Continue" if has_next else "Save"
         return html.Div(
             [
                 _section_heading(step_meta),
                 _stepper(step_meta["slug"]),
                 html.Div(body, className="mb-3"),
-                dbc.Button("Save & Continue", id=button_id, color="primary"),
+                dbc.Button(save_btn_text, id=button_id, color="primary"),
                 dbc.Modal(
                     [
                         dbc.ModalHeader("Ready for the next step"),
-                        dbc.ModalBody(f"Move to {next_slug.replace('-', ' ').title()}?"),
+                        dbc.ModalBody(modal_body),
                         dbc.ModalFooter(
                             [
                                 dbc.Button("Stay", id=f"{button_id}-close", className="me-2"),
                                 dcc.Link(
-                                    dbc.Button("Next →", color="primary"),
-                                    href=f"/forecast/{next_slug}" if next_slug else "/forecast",
+                                    dbc.Button(next_btn_text, color="primary"),
+                                    href=next_href,
                                     style={"textDecoration": "none"},
                                 ),
                             ]
