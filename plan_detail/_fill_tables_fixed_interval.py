@@ -14,7 +14,7 @@ from plan_store import get_plan
 from cap_store import resolve_settings, load_roster_long
 from ._grain_cols import interval_cols_for_day
 from ._common import _week_span
-from ._calc import _fill_tables_fixed
+from ._calc import _fill_tables_fixed, get_cached_consolidated_calcs
 from ._common import (
     _canon_scope,
     _assemble_voice,
@@ -79,7 +79,8 @@ def _slot_series_for_day(df: pd.DataFrame, day: dt.date, val_col: str) -> Dict[s
     if d.empty:
         return {}
     labs_raw = d[c_ivl].astype(str)
-    labs = labs_raw.map(lambda x: _fmt_hhmm(_parse_time_any(x)) if _parse_time_any(x) else None)
+    times = labs_raw.map(_parse_time_any)
+    labs = times.map(lambda t: _fmt_hhmm(t) if t else None)
     vals = pd.to_numeric(d.get(val_col), errors="coerce").fillna(0.0)
     tmp = pd.DataFrame({"lab": labs, "val": vals}).dropna(subset=["lab"]).copy()
     if tmp.empty:
@@ -322,8 +323,64 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         (plan.get("site") or plan.get("location") or plan.get("country") or "").strip(),
     )
     settings = resolve_settings(ba=plan.get("vertical"), subba=plan.get("sub_ba"), lob=ch)
+    calc_bundle = get_cached_consolidated_calcs(
+        int(pid),
+        settings=settings,
+        version_token=_tick,
+    ) if pid else {}
+    def _from_bundle(key: str) -> pd.DataFrame:
+        if not isinstance(calc_bundle, dict):
+            return pd.DataFrame()
+        val = calc_bundle.get(key)
+        return val if isinstance(val, pd.DataFrame) else pd.DataFrame()
 
-    start_hhmm, end_hhmm = _infer_window(plan, ref_day, ch, sk)
+    # Prefer cached interval calcs; fallback to assembled raw uploads
+    if ch == "voice":
+        vF = _from_bundle("voice_ivl_f"); vA = _from_bundle("voice_ivl_a"); vT = _from_bundle("voice_ivl_t")
+        if vF.empty and vA.empty and vT.empty:
+            vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual"); vT = _assemble_voice(sk, "tactical")
+    elif ch == "chat":
+        cF = _from_bundle("chat_ivl_f"); cA = _from_bundle("chat_ivl_a"); cT = _from_bundle("chat_ivl_t")
+        if cF.empty and cA.empty and cT.empty:
+            cF = _assemble_chat(sk, "forecast"); cA = _assemble_chat(sk, "actual"); cT = _assemble_chat(sk, "tactical")
+        vF = cF; vA = cA; vT = cT
+    else:  # outbound
+        oF = _from_bundle("ob_ivl_f"); oA = _from_bundle("ob_ivl_a"); oT = _from_bundle("ob_ivl_t")
+        if oF.empty and oA.empty and oT.empty:
+            oF = _assemble_ob(sk, "forecast"); oA = _assemble_ob(sk, "actual"); oT = _assemble_ob(sk, "tactical")
+        vF = oF; vA = oA; vT = oT
+
+    # Infer window using already-loaded interval data; fallback to roster-based inference
+    def _window_from_df(df: pd.DataFrame) -> tuple[Optional[str], Optional[str]]:
+        try:
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return None, None
+            d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
+            c_date = L.get("date") or L.get("day"); ivc = _pick_ivl_col(d)
+            if not ivc:
+                return None, None
+            if c_date:
+                d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+                d = d[d[c_date].eq(ref_day)]
+            if d.empty:
+                return None, None
+            times = d[ivc].astype(str).map(_parse_time_any).dropna()
+            if times.empty:
+                return None, None
+            return _fmt_hhmm(times.min()), _fmt_hhmm(times.max())
+        except Exception:
+            return None, None
+
+    start_hhmm, end_hhmm = None, None
+    for df in (vF, vA):
+        s, e = _window_from_df(df)
+        start_hhmm = start_hhmm or s
+        end_hhmm = end_hhmm or e
+        if start_hhmm and end_hhmm:
+            break
+    if not start_hhmm or not end_hhmm:
+        start_hhmm, end_hhmm = _infer_window(plan, ref_day, ch, sk)
+
     ivl_cols, ivl_ids = interval_cols_for_day(ref_day, ivl_min=ivl_min, start_hhmm=start_hhmm, end_hhmm=end_hhmm)
     cols = ivl_ids  # backward compat alias
 
@@ -376,7 +433,6 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
 
     # Channel-specific fills
     if ch == "voice":
-        vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual"); vT = _assemble_voice(sk, "tactical")
         volF = _slot_series_for_day(vF, ref_day, "volume")
         volA = _slot_series_for_day(vA if isinstance(vA, pd.DataFrame) and not vA.empty else vF, ref_day, "volume")
         volT = _slot_series_for_day(vT, ref_day, "volume")
@@ -500,7 +556,6 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 fw_i.loc[mser == "Occupancy", lab] = occ
 
     elif ch == "chat":
-        cF = _assemble_chat(sk, "forecast"); cA = _assemble_chat(sk, "actual"); cT = _assemble_chat(sk, "tactical")
         volF_map = _slot_series_for_day(cF, ref_day, "items") or _slot_series_for_day(cF, ref_day, "volume")
         volA_map = _slot_series_for_day(cA if isinstance(cA, pd.DataFrame) and not cA.empty else cF, ref_day, "items")
         volT_map = _slot_series_for_day(cT, ref_day, "items") or {}
@@ -577,10 +632,16 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 fw_i.loc[mser == "Occupancy", lab] = occ
 
     elif ch in ("outbound", "ob"):
-        oF = _assemble_ob(sk, "forecast"); oA = _assemble_ob(sk, "actual"); oT = _assemble_ob(sk, "tactical")
-        volF = _slot_series_for_day(oF, ref_day, "opc") or _slot_series_for_day(oF, ref_day, "dials") or _slot_series_for_day(oF, ref_day, "calls") or _slot_series_for_day(oF, ref_day, "volume")
-        volA = _slot_series_for_day(oA, ref_day, "opc") or _slot_series_for_day(oA, ref_day, "dials") or _slot_series_for_day(oA, ref_day, "calls") or _slot_series_for_day(oA, ref_day, "volume")
-        volT = _slot_series_for_day(oT, ref_day, "opc") or {}
+        def _alias_opc(df: pd.DataFrame) -> pd.DataFrame:
+            if not isinstance(df, pd.DataFrame):
+                return pd.DataFrame()
+            if "opc" not in df.columns and "items" in df.columns:
+                return df.rename(columns={"items": "opc"})
+            return df
+        oF = _alias_opc(vF); oA = _alias_opc(vA); oT = _alias_opc(vT)
+        volF = _slot_series_for_day(oF, ref_day, "opc") or _slot_series_for_day(oF, ref_day, "dials") or _slot_series_for_day(oF, ref_day, "calls") or _slot_series_for_day(oF, ref_day, "volume") or _slot_series_for_day(oF, ref_day, "items")
+        volA = _slot_series_for_day(oA, ref_day, "opc") or _slot_series_for_day(oA, ref_day, "dials") or _slot_series_for_day(oA, ref_day, "calls") or _slot_series_for_day(oA, ref_day, "volume") or _slot_series_for_day(oA, ref_day, "items")
+        volT = _slot_series_for_day(oT, ref_day, "opc") or _slot_series_for_day(oT, ref_day, "items") or {}
         aht_map = _slot_series_for_day(oF, ref_day, "aht_sec") or _slot_series_for_day(oF, ref_day, "aht")
         mser = fw_i["metric"].astype(str)
         for lab in ivl_ids:
