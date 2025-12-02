@@ -8,6 +8,7 @@ from common import header_bar, sidebar_component
 from planning_workspace import planning_layout, register_planning_ws
 from plan_detail import plan_detail_validation_layout, register_plan_detail
 from plan_store import auto_lock_previous_month_plans
+from pages.forecast_page import page_forecast_section
 from callbacks_pkg import *  # registers callbacks
 
 
@@ -17,6 +18,7 @@ app.layout = html.Div([
     dcc.Store(id="sidebar_collapsed", data=True, storage_type="session"),
     dcc.Store(id="nav-log-dummy"),
     dcc.Store(id="global-loading", data=False),
+    dcc.Store(id="forecast-phase-store", storage_type="session"),
     _planning_ids_skeleton(),
     html.Div(id="app-wrapper", className="sidebar-collapsed", children=[
         html.Div(id="sidebar", children=sidebar_component(False).children),
@@ -57,9 +59,16 @@ app.validation_layout = html.Div([
     dcc.Store(id="ws-selected-ba"),
     dcc.Store(id="ws-refresh"),
     dcc.Store(id="global-loading"),
+    dcc.Store(id="forecast-phase-store"),
     header_bar(),
     planning_layout(),
     plan_detail_validation_layout(),
+    # Forecasting workspace stubs for callback validation
+    page_forecast_section("volume-summary"),
+    page_forecast_section("smoothing-anomaly"),
+    page_forecast_section("forecasting"),
+    page_forecast_section("transformation-projects"),
+    page_forecast_section("daily-interval"),
     dash_table.DataTable(id="tbl-projects"),
     # Placeholders for Home timeline callback targets so Dash can validate callbacks globally
     html.Div(id="timeline-body"),
